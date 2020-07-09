@@ -1,11 +1,21 @@
 
+# Deploy app
+#rsconnect::deployApp(here::here("Runnr"), account = "jake-wittman")
+
 # Libraries ---------------------------------------------------------------
 if (!require(pacman)) install.packages("pacman")
 
-pacman::p_load(googlesheets)
-pacman::p_load(shiny)
-pacman::p_load(tidyverse)
+# install.packages("googlesheets")
+# install.packages("shiny")
+# install.packages("tidyverse")
 
+library(googlesheets)
+library(shiny)
+library(tidyverse)
+library(kableExtra)
+library(conflicted)
+library(lubridate)
+conflicted::conflict_prefer("filter", "dplyr")
 
 
 # Import data from googledrive --------------------------------------------
@@ -107,9 +117,9 @@ running$pace.sec <- time.sec / dist # matrix to hold pace in seconds per mile
 
 # Shoe info
 retired_shoes <- c("saucony_red",
-                   "saucony_peregrine",
                    "netwon_kimset_orange",
-                   "kinvara_7_green")
+                   "kinvara_7_green",
+                   "2019_10_freedom")
 shoe_miles_table <- running %>% 
   group_by(shoe) %>% 
   summarise(sum = sum(distance.miles)) %>% 
@@ -118,14 +128,15 @@ shoe_miles_table <- running %>%
       shoe %in% retired_shoes ~ 0,
       TRUE ~ 1
    )) %>% 
-   filter(active == 1)
+   filter(active == 1) %>% 
+   select(-active)
 
 running$hr.zone <- cut(running$avg.heart.rate,
                        breaks = c(-Inf, 137, 146, 158, 164, 177),
                        labels = c("Recovery","Easy","Med/Long/MP", "Lac_Thresh","Interval"))
 
-y_axis_pace <- c("7:00", "8:00", "9:00", "10:00", "11:00", "12:00") 
-y_ticks_pace <- c(seq(420, 720, 60))
+y_axis_pace <- c("5:00", "6:00", "7:00", "8:00", "9:00", "10:00", "11:00", "12:00") 
+y_ticks_pace <- c(seq(300, 720, 60))
 
 # Clean dates and get weekly/monthly stuff
 running$date <- as.Date(running$date, "%m/%d/%Y")
@@ -142,7 +153,7 @@ colnames(weekly.totals) <- c("week.start", "week.end", "total.miles", "n.runs")
 colnames(monthly.totals) <- c("month.start", "total.miles", "n.runs")
 
 #calculate weekly totals
-for (i in week.id){
+for (i in week.id) {
    temp.dat <- running[running$uid.week == i, ]
    weekly.totals[i, "total.miles"] <- sum(temp.dat$distance.miles)
    weekly.totals[i, "week.start"] <- as.character(temp.dat$week[1])
@@ -151,14 +162,18 @@ for (i in week.id){
 }
 
 #calculate monthly totals
-for (i in month.id){
+for (i in month.id) {
    temp.dat <- running[running$uid.month == i, ]
    monthly.totals[i, "total.miles"] <- sum(temp.dat$distance.miles)
    monthly.totals[i, "month.start"] <- as.character(temp.dat$month[1])
    monthly.totals[i, "n.runs"] <- nrow(temp.dat)
 }
 
+weekly.totals <- weekly.totals %>% 
+   mutate(week.start = as_date(week.start),
+          week.end = as_date(week.end))
 
+   
 
 # Define UI for application that draws a histogram
 ui <- fluidPage(
@@ -169,18 +184,19 @@ ui <- fluidPage(
    # Sidebar with a slider input for number of bins 
    sidebarLayout(
       sidebarPanel(
-         sliderInput("bins",
-                     "Number of bins:",
-                     min = 1,
-                     max = 50,
-                     value = 30)
+         dateRangeInput("dates",
+                     "Date range to graph",
+                     start = min(running$date),
+                     end = max(running$date))
       ),
       
       # Show a plot of the generated distribution
       mainPanel(
          plotOutput("pace_date_plot"),
          plotOutput("pace_hronly_date_plot"),
-         tableOutput("shoe_mileage")
+         tableOutput("shoe_mileage"),
+         tableOutput("weekly_mileage_table"),
+         tableOutput("monthly_mileage_table")
       )
    )
 )
@@ -189,15 +205,18 @@ ui <- fluidPage(
 server <- function(input, output) {
    
    output$pace_date_plot <- renderPlot({
-      all.runs.paces <-
-         ggplot(data = running, aes(x = date, y = pace.sec))
+      all.runs.paces <- running %>% 
+         filter(date >= input$dates[1] & date <= input$dates[2]) %>% 
+         ggplot(aes(x = date, y = pace.sec, colour = factor(hr.zone)))
+      
       all.runs.paces +
          theme_bw() +
-         geom_point(aes(colour = factor(running$hr.zone))) +
+         geom_point() +
          scale_x_date(date_labels = "%b-%y", date_breaks = "24 weeks") +
          scale_y_continuous(breaks = y_ticks_pace,
                             label = y_axis_pace,
-                            limits = c(420, 720)) +
+                            limits = c(min(y_ticks_pace),
+                                       max(y_ticks_pace))) +
          ylab("Pace (min/mile)") +
          theme(text = element_text(size = 18),
                axis.text.x = element_text(angle = 70, hjust = 1)) +
@@ -206,8 +225,10 @@ server <- function(input, output) {
    
    output$pace_hronly_date_plot <- renderPlot({
       hr_only_running <- running %>%
-         filter(!is.na(avg.heart.rate)) %>% 
+         filter(date >= input$dates[1] & date <= input$dates[2],
+                !is.na(avg.heart.rate)) %>% 
          mutate(hr.zone = as.factor(hr.zone))
+      
       hr_only_running %>%
          ggplot(aes(x = date, y = pace.sec)) +
          theme_bw() +
@@ -215,7 +236,8 @@ server <- function(input, output) {
          scale_x_date(date_labels = "%b-%y", date_breaks = "8 weeks") +
          scale_y_continuous(breaks = y_ticks_pace,
                             label = y_axis_pace,
-                            limits = c(420, 720)) +
+                            limits = c(min(y_ticks_pace),
+                                       max(y_ticks_pace))) +
          xlab("Date") +
          ylab("Pace (min/mile)") +
          theme(text = element_text(size = 18),
@@ -223,9 +245,48 @@ server <- function(input, output) {
          labs(color = "Heart Rate Zone")
    })
    
-   output$shoe_mileage <- renderTable({
-      shoe_miles_table
-   })
+   output$shoe_mileage <- function() {
+      shoe_miles_table %>% 
+         arrange(sum) %>% 
+         knitr::kable(format = "html",
+                      col.names = c("Shoe", "Total miles"),
+                      caption = "Miles run in each pair of shoes") %>% 
+         kable_styling("striped")
+   }
+   
+   output$weekly_mileage_table <- function() {
+      tail(weekly.totals, n = 9) %>%
+         knitr::kable(
+            format = "html",
+            col.names = c("Start of week",
+                          "End of week",
+                          "Weekly Miles",
+                          "Number of Runs"),
+            caption = "Weekly mileage for the current week and the last 8 weeks"
+         ) %>% 
+         kable_styling("striped")
+   }
+   
+   output$monthly_mileage_table <- function() {
+      library(knitr)
+      monthly.totals %>%
+         mutate(
+            month.start = parse_date_time(month.start, "ym"),
+            Month = month(month.start, label = TRUE, abbr = TRUE),
+            Year = year(month.start)
+         ) %>%
+         select(Year, Month, total.miles, n.runs) %>%
+         slice_tail(n = 12) %>%
+         kable(
+            format = "html",
+            col.names = c("Year",
+                          "Month",
+                          "Total Miles",
+                          "Number of Runs"),
+            caption = "Monthly mileage for the year"
+         ) %>%
+         kable_styling("striped")
+   }
 }
 
 # Run the application 
