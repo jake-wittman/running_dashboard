@@ -1,0 +1,507 @@
+---
+title: "Runnr"
+format:
+  dashboard:
+    scrolling: true
+server: shiny
+---
+
+```{r}
+#| context: setup
+#| output: false
+
+library(shiny)
+library(lubridate)
+library(DT)
+library(stringr)
+library(conflicted)
+library(tidyverse)
+ 
+conflicted::conflict_prefer("filter", "dplyr")
+
+# Import and prepare running data -----------------------------------------
+parse_run_date <- function(x) {
+  # Match complete dates explicitly: guessing/truncation can interpret
+  # 8/8/2011 as 2008-08-20 and accept mistyped years such as 0023.
+  x <- trimws(as.character(x))
+  result <- as.Date(rep(NA_character_, length(x)))
+  formats <- c(
+    "^\\d{1,2}/\\d{1,2}/\\d{4}$" = "%m/%d/%Y",
+    "^\\d{1,2}/\\d{1,2}/\\d{2}$" = "%m/%d/%y",
+    "^\\d{4}-\\d{1,2}-\\d{1,2}$" = "%Y-%m-%d"
+  )
+  for (pattern in names(formats)) {
+    matched <- !is.na(x) & grepl(pattern, x)
+    result[matched] <- as.Date(x[matched], format = formats[[pattern]])
+  }
+  # These are modern running logs. Flag implausible years instead of
+  # guessing a correction or expanding the chart across centuries.
+  invalid <- !is.na(result) & (year(result) < 1900 | year(result) > year(Sys.Date()) + 1)
+  result[invalid] <- NA
+  rejected <- !is.na(x) & nzchar(x) & is.na(result)
+  if (any(rejected)) {
+    warning("Unrecognized running dates (excluded from date-based summaries): ",
+            paste(unique(x[rejected]), collapse = ", "), call. = FALSE)
+  }
+  result
+}
+
+running <- read_csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vQ6WOA3AOFScjC94zIYvHhjCz20iWZDclAD8NJZyTlLJKYmsTWnsJiYvHqnhdRIELgovhujvIwNEUQv/pub?gid=0&single=true&output=csv")
+running <- running[, -16]
+running$avg_hr <- as.numeric(running$avg_hr)
+
+names(running) <- c(
+  "date", "time", "distance_miles", "avg_heart_rate", "pace", "notes",
+  "training_cycle", "easy", "long", "interval", "threshold", "recovery",
+  "hard", "race", "cross_training"
+)
+
+running <- running %>%
+  mutate(run_type = case_when(
+    easy == 1 ~ "easy",
+    long == 1 ~ "long",
+    interval == 1 ~ "vo2_max",
+    threshold == 1 ~ "lactate_threshold",
+    recovery == 1 ~ "recovery",
+    hard == 1 ~ "vo2_max",
+    race == 1 ~ "race"
+  )) %>%
+  select(date:pace, run_type)
+running$date <- parse_run_date(running$date)
+
+running2 <- read_csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vRD-AMfL1-tco3MorSqva8nmAgkjNnd-Ujhy4vdaPs5bl9rSdiSPTqb_1_PyXe7DQQVw4eSddQJSaTb/pub?gid=1481357316&single=true&output=csv") 
+
+names(running2) <- c(
+  "date", "distance_miles", "time", "avg_heart_rate", "shoe", "run_type",
+  "notes", "running_partner", "partner_name", "time_stamp", "RPE"
+)
+running2  <- running2 %>% 
+  filter(distance_miles > 0)
+running2$date <- parse_run_date(running2$date)
+running$shoe <- NA
+running <- bind_rows(running, running2) %>%
+  mutate(
+    time2 = case_when(nchar(time) <= 6 ~ paste0(time, ":00"), TRUE ~ time),
+    time3 = str_sub(time2, 1, str_length(time2) - 3),
+    time_min_sec = ms(time3),
+    time_sec = period_to_seconds(time_min_sec),
+    pace_sec = time_sec / distance_miles,
+    pace_sec_period = seconds_to_period(pace_sec),
+    year = year(date),
+    week = week(date),
+    month = month(date),
+    month_uid = floor_date(date, unit = "month"),
+    week_uid = floor_date(date, unit = "week", week_start = 1)
+  ) %>%
+  select(-time2, -time3)
+
+retired_shoes <- c(
+  "saucony_red", "netwon_kimset_orange", "kinvara_7_green",
+  "2020_02_clifton", "2020_03_clifton_grey", "triumph", "brooks_levitate",
+  "kinvara_8_water", "saucony_peregrine", "2019_01_triumph",
+  "2021_03_saucony_kinvara", "2021_02_clifton_franklin",
+  "2019_10_saucony_freedom", "2023_09_altra_lone", '2023_08_hoka_mach5',
+  '2024_01_topo_flilyte4', '2023_03_altra_rivera', '2024_05_topo_specter'
+)
+
+shoe_miles_table <- running %>%
+  group_by(shoe) %>%
+  summarise(sum = sum(distance_miles), .groups = "drop") %>%
+  filter(!is.na(shoe)) %>%
+  filter_out(str_detect(shoe, 'elliptical|2021|2022|2023|2024')) |> 
+  mutate(active = if_else(shoe %in% retired_shoes, 0, 1)) %>%
+  filter(active == 1) %>%
+  select(-active) %>%
+  separate(shoe, c("year", "month", "make", "model"), sep = "_")
+
+active_shoe_run_type_totals <- running %>%
+  filter(!is.na(shoe), !shoe %in% retired_shoes) %>%
+  filter_out(str_detect(shoe, 'elliptical|2021|2022|2023|2024')) |> 
+  mutate(shoe_label = str_to_title(str_replace_all(shoe, "_", " "))) %>%
+  group_by(shoe_label, run_type) %>%
+  summarise(total_miles = sum(distance_miles, na.rm = TRUE), .groups = "drop") %>%
+  mutate(shoe_label = fct_reorder(shoe_label, total_miles, .fun = sum))
+
+running$hr_zone <- cut(
+  running$avg_heart_rate,
+  breaks = c(-Inf, 137, 146, 158, 164, 177),
+  labels = c("Recovery", "Easy", "Med/Long/MP", "Lac_Thresh", "Interval")
+)
+
+weekly_totals <- running %>%
+  group_by(week_uid) %>%
+  summarise(
+    total_miles = sum(distance_miles),
+    week_start = as.Date(first(week_uid)),
+    week_end = as.Date(first(week_uid + 6)),
+    n_runs = n(),
+    .groups = "drop"
+  )
+
+monthly_totals <- running %>%
+  group_by(month_uid) %>%
+  summarise(
+    total_miles = sum(distance_miles),
+    month = first(month),
+    year = first(year),
+    .groups = "drop"
+  )
+
+plot_choices <- list(
+  "Date" = "date",
+  "Duration" = "time",
+  "Distance (miles)" = "distance_miles",
+  "Average heart rate" = "avg_heart_rate",
+  "Pace (min/mi)" = "pace_sec",
+  "Run type" = "run_type",
+  "Shoes worn" = "shoe",
+  "Year" = "year",
+  "Week" = "week",
+  "Month" = "month",
+  "RPE" = "RPE"
+)
+
+# Calendar metrics. Weeks always begin on Monday.
+current_week_start <- floor_date(Sys.Date(), unit = "week", week_start = 1)
+previous_week_start <- current_week_start - weeks(1)
+two_weeks_ago_start <- current_week_start - weeks(2)
+current_month_start <- floor_date(Sys.Date(), unit = "month")
+current_year_start <- floor_date(Sys.Date(), unit = "year")
+
+miles_in_period <- function(start_date, end_date) {
+  running %>%
+    filter(date >= start_date, date < end_date) %>%
+    summarise(miles = sum(distance_miles, na.rm = TRUE)) %>%
+    pull(miles)
+}
+
+two_weeks_ago_miles <- miles_in_period(two_weeks_ago_start, previous_week_start)
+previous_week_miles <- miles_in_period(previous_week_start, current_week_start)
+weekly_change <- if (two_weeks_ago_miles > 0) {
+  100 * ((previous_week_miles - two_weeks_ago_miles) / two_weeks_ago_miles)
+} else {
+  NA_real_
+}
+
+current_week_miles <- miles_in_period(current_week_start, current_week_start + weeks(1))
+current_month_miles <- miles_in_period(current_month_start, current_month_start + months(1))
+current_year_miles <- miles_in_period(current_year_start, current_year_start + years(1))
+lifetime_miles <- sum(running$distance_miles, na.rm = TRUE)
+
+format_miles <- function(miles) {
+  paste0(format(round(miles, 1), big.mark = ",", trim = TRUE), " mi")
+}
+```
+
+# Overview
+
+## {.sidebar width="300px"}
+
+```{r}
+dateRangeInput(
+  "dates",
+  "Date range to graph",
+  start = min(running$date, na.rm = TRUE),
+  end = max(running$date, na.rm = TRUE)
+)
+
+checkboxGroupInput(
+  "pace_plot",
+  label = "Pace plot options",
+  choices = list("Smooth by pace" = "smooth", "Facet by pace" = "facet")
+)
+```
+
+## Content {.rows}
+
+### Summary {.columns height="140px"}
+
+#### Weekly percent increase
+
+```{r}
+#| content: valuebox
+#| title: "Weekly % increase"
+#| icon: graph-up-arrow
+#| color: primary
+
+list(value = if (is.na(weekly_change)) "N/A" else sprintf("%+.1f%%", weekly_change))
+```
+
+#### Current week mileage
+
+```{r}
+#| content: valuebox
+#| title: "Current week"
+#| icon: calendar-week
+#| color: success
+
+list(value = format_miles(current_week_miles))
+```
+
+#### Current month mileage
+
+```{r}
+#| content: valuebox
+#| title: "Current month"
+#| icon: calendar-month
+#| color: info
+
+list(value = format_miles(current_month_miles))
+```
+
+#### Current year mileage
+
+```{r}
+#| content: valuebox
+#| title: "Current year"
+#| icon: calendar-range
+#| color: warning
+
+list(value = format_miles(current_year_miles))
+```
+
+#### Lifetime mileage
+
+```{r}
+#| content: valuebox
+#| title: "Lifetime mileage"
+#| icon: infinity
+#| color: danger
+
+list(value = format_miles(lifetime_miles))
+```
+
+### Training trends {.columns}
+
+#### Weekly mileage
+
+```{r}
+#| title: "Weekly mileage"
+
+plotOutput("weekly_mileage_plot", height = "420px")
+```
+
+#### Pace over time
+
+```{r}
+#| title: "Pace over time"
+
+plotOutput("pace_date_plot", height = "420px")
+```
+
+### Active shoe mileage by run type
+
+```{r}
+#| title: "Mileage on active shoes by run type"
+
+plotOutput("shoe_run_type_plot", height = "460px")
+```
+
+# Activity
+
+## Activity data
+
+### Daily runs
+
+```{r}
+#| title: "Daily runs"
+
+DTOutput("activity_daily_runs")
+```
+
+### Active shoe mileage
+
+```{r}
+#| title: "Mileage on shoes currently active"
+
+DTOutput("activity_shoe_mileage")
+```
+
+# Tables
+
+## Mileage tables
+
+### Weekly mileage
+
+```{r}
+#| title: "Weekly mileage"
+
+DTOutput("weekly_mileage_table")
+```
+
+### Active shoe mileage
+
+```{r}
+#| title: "Mileage"
+
+DTOutput("table_shoe_mileage")
+```
+
+### Daily runs
+
+```{r}
+#| title: "Daily runs"
+
+DTOutput("table_daily_runs")
+```
+
+### Monthly mileage
+
+```{r}
+#| title: "Monthly mileage"
+
+DTOutput("monthly_mileage_table")
+```
+
+# Exploration
+
+## {.sidebar width="300px"}
+
+```{r}
+numericInput(
+  "max_distance",
+  "Maximum distance to plot",
+  value = 30,
+  min = 1
+)
+
+selectInput("x_axis", "X-axis data", choices = plot_choices, selected = "date")
+selectInput("y_axis", "Y-axis data", choices = plot_choices, selected = "pace_sec")
+```
+
+## Pace vs distance
+
+```{r}
+#| title: "Pace vs distance"
+
+plotOutput("pace_distance_plot", height = "600px")
+```
+
+```{r}
+#| context: server
+#| output: true 
+
+output$pace_date_plot <- renderPlot({
+  pace_p <- running %>%
+    filter(
+      date >= input$dates[1],
+      date <= input$dates[2],
+      distance_miles <= input$max_distance
+    ) %>%
+    ggplot(aes(
+      x = date,
+      y = pace_sec,
+      colour = factor(run_type),
+      group = factor(run_type)
+    )) +
+    theme_bw() +
+    geom_point() +
+    scale_x_date(date_labels = "%b-%y", date_breaks = "24 weeks") +
+    scale_y_time() +
+    labs(color = "Run type", x = "Date", y = "Pace (min/mile)") +
+    theme(
+      text = element_text(size = 14),
+      axis.text.x = element_text(angle = 70, hjust = 1)
+    )
+
+  if ("smooth" %in% input$pace_plot) {
+    pace_p <- pace_p + geom_smooth()
+  }
+  if ("facet" %in% input$pace_plot) {
+    pace_p <- pace_p + facet_wrap(~factor(run_type))
+  }
+  pace_p
+})
+
+output$weekly_mileage_plot <- renderPlot({
+  weekly_totals %>%
+    ggplot(aes(x = week_start, y = total_miles)) +
+    geom_col(fill = "#2f80ed", width = 6) +
+    scale_x_date(date_labels = "%b\n%Y", date_breaks = "12 weeks") +
+    labs(x = "Week starting", y = "Miles") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+})
+
+output$shoe_run_type_plot <- renderPlot({
+  active_shoe_run_type_totals %>%
+    ggplot(aes(x = shoe_label, y = total_miles, fill = run_type)) +
+    geom_col() +
+    geom_hline(yintercept = 400) +
+    scale_fill_brewer(palette = "Set2", na.value = "grey70") +
+    labs(x = "Active shoe", y = "Miles", fill = "Run type") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+})
+
+daily_runs_table <- function() {
+  running %>%
+    arrange(desc(date)) %>%
+    select(
+      Date = date,
+      Time = time,
+      Distance = distance_miles,
+      Pace = pace_sec_period,
+      Type = run_type,
+      Shoe = shoe
+    ) %>%
+    mutate(Pace = round(Pace, digits = 2))
+}
+
+active_shoe_table <- function() {
+  shoe_miles_table %>%
+    mutate(across(c(year, month), as.numeric)) %>%
+    arrange(desc(year), desc(month)) %>%
+    mutate(
+      month = month.abb[month],
+      date = paste0(month, " ", year),
+      make = str_to_title(make),
+      model = str_to_title(model)
+    ) %>%
+    select(Make = make, Model = model, Distance = sum, Started = date)
+}
+
+output$activity_daily_runs <- renderDT({
+  datatable(daily_runs_table(), options = list(pageLength = 10))
+})
+
+output$activity_shoe_mileage <- renderDT({
+  datatable(active_shoe_table(), options = list(pageLength = 10))
+})
+
+output$weekly_mileage_table <- renderDT({
+  weekly_totals %>%
+    arrange(desc(week_uid)) %>%
+    select(Start = week_start, End = week_end, Distance = total_miles, n = n_runs) %>%
+    datatable(options = list(pageLength = 10))
+})
+
+output$table_shoe_mileage <- renderDT({
+  datatable(active_shoe_table(), options = list(pageLength = 10))
+})
+
+output$table_daily_runs <- renderDT({
+  datatable(daily_runs_table(), options = list(pageLength = 10))
+})
+
+output$monthly_mileage_table <- renderDT({
+  monthly_totals %>%
+    arrange(desc(month_uid)) %>%
+    mutate(month = month.name[month]) %>%
+    select(Month = month, Year = year, Distance = total_miles) %>%
+    datatable(options = list(pageLength = 12))
+})
+
+output$pace_distance_plot <- renderPlot({
+  running %>%
+    filter(distance_miles < input$max_distance) %>%
+    ggplot(aes(x = .data[[input$x_axis]], y = .data[[input$y_axis]])) +
+    theme_bw() +
+    geom_point(aes(colour = factor(hr_zone))) +
+    theme(
+      text = element_text(size = 14),
+      axis.text.x = element_text(angle = 70, hjust = 1)
+    ) +
+    labs(color = "Heart rate zone")
+})
+```
