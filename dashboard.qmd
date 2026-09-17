@@ -3,6 +3,7 @@ title: "Runnr"
 format:
   dashboard:
     scrolling: true
+    theme: [cosmo, dashboard-theme.scss]
 server: shiny
 ---
 
@@ -18,6 +19,32 @@ library(conflicted)
 library(tidyverse)
  
 conflicted::conflict_prefer("filter", "dplyr")
+
+# Shared visual language for every plot and table.
+theme_runnr <- function() {
+  theme_minimal(base_size = 13, base_family = "sans") +
+    theme(
+      text = element_text(colour = "#243E38"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "#E7ECE8", linewidth = 0.35),
+      panel.grid.major.x = element_blank(),
+      axis.text = element_text(colour = "#60716B"),
+      axis.title = element_text(size = 10),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold", size = 10),
+      legend.text = element_text(size = 9),
+      legend.key.size = grid::unit(0.35, "cm"),
+      strip.text = element_text(face = "bold", colour = "#243E38"),
+      plot.background = element_rect(fill = "white", colour = NA),
+      plot.margin = margin(14, 16, 10, 10)
+    )
+}
+
+dashboard_table <- function(data, page_length = 10) {
+  datatable(data, rownames = FALSE, class = "stripe hover",
+    options = list(pageLength = page_length, scrollX = TRUE, order = list(),
+                   language = list(search = "Search", lengthMenu = "Show _MENU_ rows")))
+}
 
 # Import and prepare running data -----------------------------------------
 parse_run_date <- function(x) {
@@ -128,6 +155,12 @@ running$hr_zone <- cut(
   labels = c("Recovery", "Easy", "Med/Long/MP", "Lac_Thresh", "Interval")
 )
 
+run_types <- sort(unique(na.omit(running$run_type)))
+run_colors <- setNames(rep(c("#267D71", "#B47939", "#647EB0", "#A45D74",
+                            "#7A8545", "#805DA3", "#4D94A2", "#A65443",
+                            "#536D59", "#93816B"), length.out = length(run_types)), run_types)
+run_labels <- function(x) str_to_sentence(str_replace_all(x, "_", " "))
+
 weekly_totals <- running %>%
   group_by(week_uid) %>%
   summarise(
@@ -195,14 +228,16 @@ format_miles <- function(miles) {
 
 # Overview
 
-## {.sidebar width="300px"}
+## {.sidebar width="250px"}
+
+### Training filters
 
 ```{r}
 dateRangeInput(
   "dates",
   "Date range to graph",
-  start = min(running$date, na.rm = TRUE),
-  end = max(running$date, na.rm = TRUE)
+  start = today()-years(1),
+  end = today()
 )
 
 checkboxGroupInput(
@@ -214,13 +249,13 @@ checkboxGroupInput(
 
 ## Content {.rows}
 
-### Summary {.columns height="140px"}
+### Summary {.columns .summary-row height="140px"}
 
 #### Weekly percent increase
 
 ```{r}
 #| content: valuebox
-#| title: "Weekly % increase"
+#| title: "Weekly change"
 #| icon: graph-up-arrow
 #| color: primary
 
@@ -271,7 +306,7 @@ list(value = format_miles(current_year_miles))
 list(value = format_miles(lifetime_miles))
 ```
 
-### Training trends {.columns}
+### Training trends {.columns .trend-row}
 
 #### Weekly mileage
 
@@ -301,7 +336,7 @@ plotOutput("shoe_run_type_plot", height = "460px")
 
 ## Activity data
 
-### Daily runs
+### Daily runs {width="65%"}
 
 ```{r}
 #| title: "Daily runs"
@@ -309,7 +344,7 @@ plotOutput("shoe_run_type_plot", height = "460px")
 DTOutput("activity_daily_runs")
 ```
 
-### Active shoe mileage
+### Active shoe mileage {width="35%"}
 
 ```{r}
 #| title: "Mileage on shoes currently active"
@@ -337,6 +372,8 @@ DTOutput("weekly_mileage_table")
 DTOutput("table_shoe_mileage")
 ```
 
+## Run history
+
 ### Daily runs
 
 ```{r}
@@ -355,7 +392,9 @@ DTOutput("monthly_mileage_table")
 
 # Exploration
 
-## {.sidebar width="300px"}
+## {.sidebar width="250px"}
+
+### Explore your runs
 
 ```{r}
 numericInput(
@@ -394,14 +433,14 @@ output$pace_date_plot <- renderPlot({
       colour = factor(run_type),
       group = factor(run_type)
     )) +
-    theme_bw() +
-    geom_point() +
-    scale_x_date(date_labels = "%b-%y", date_breaks = "24 weeks") +
+    theme_runnr() +
+    geom_point(alpha = 0.65, size = 1.6) +
+    scale_colour_manual(values = run_colors, labels = run_labels, na.value = "#99A5A0") +
+    scale_x_date(date_labels = "%b %Y", breaks = scales::breaks_pretty(n = 6)) +
     scale_y_time() +
     labs(color = "Run type", x = "Date", y = "Pace (min/mile)") +
     theme(
-      text = element_text(size = 14),
-      axis.text.x = element_text(angle = 70, hjust = 1)
+      axis.text.x = element_text(angle = 35, hjust = 1)
     )
 
   if ("smooth" %in% input$pace_plot) {
@@ -415,11 +454,13 @@ output$pace_date_plot <- renderPlot({
 
 output$weekly_mileage_plot <- renderPlot({
   weekly_totals %>%
+    filter( week_uid >= input$dates[1],
+      week_uid <= input$dates[2]) |> 
     ggplot(aes(x = week_start, y = total_miles)) +
-    geom_col(fill = "#2f80ed", width = 6) +
-    scale_x_date(date_labels = "%b\n%Y", date_breaks = "12 weeks") +
+    geom_col(fill = "#267D71", width = 6) +
+    scale_x_date(date_labels = "%b\n%Y", breaks = scales::breaks_pretty(n = 6)) +
     labs(x = "Week starting", y = "Miles") +
-    theme_minimal(base_size = 14) +
+    theme_runnr() +
     theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
 })
 
@@ -427,10 +468,10 @@ output$shoe_run_type_plot <- renderPlot({
   active_shoe_run_type_totals %>%
     ggplot(aes(x = shoe_label, y = total_miles, fill = run_type)) +
     geom_col() +
-    geom_hline(yintercept = 400) +
-    scale_fill_brewer(palette = "Set2", na.value = "grey70") +
+    geom_hline(yintercept = 400, colour = "#A65443", linetype = "dashed", linewidth = 0.5) +
+    scale_fill_manual(values = run_colors, labels = run_labels, na.value = "#99A5A0") +
     labs(x = "Active shoe", y = "Miles", fill = "Run type") +
-    theme_minimal(base_size = 14) +
+    theme_runnr() +
     theme(axis.text.x = element_text(angle = 35, hjust = 1))
 })
 
@@ -462,26 +503,26 @@ active_shoe_table <- function() {
 }
 
 output$activity_daily_runs <- renderDT({
-  datatable(daily_runs_table(), options = list(pageLength = 10))
+  dashboard_table(daily_runs_table())
 })
 
 output$activity_shoe_mileage <- renderDT({
-  datatable(active_shoe_table(), options = list(pageLength = 10))
+  dashboard_table(active_shoe_table())
 })
 
 output$weekly_mileage_table <- renderDT({
   weekly_totals %>%
     arrange(desc(week_uid)) %>%
     select(Start = week_start, End = week_end, Distance = total_miles, n = n_runs) %>%
-    datatable(options = list(pageLength = 10))
+    dashboard_table()
 })
 
 output$table_shoe_mileage <- renderDT({
-  datatable(active_shoe_table(), options = list(pageLength = 10))
+  dashboard_table(active_shoe_table())
 })
 
 output$table_daily_runs <- renderDT({
-  datatable(daily_runs_table(), options = list(pageLength = 10))
+  dashboard_table(daily_runs_table())
 })
 
 output$monthly_mileage_table <- renderDT({
@@ -489,18 +530,20 @@ output$monthly_mileage_table <- renderDT({
     arrange(desc(month_uid)) %>%
     mutate(month = month.name[month]) %>%
     select(Month = month, Year = year, Distance = total_miles) %>%
-    datatable(options = list(pageLength = 12))
+    dashboard_table(page_length = 12)
 })
 
 output$pace_distance_plot <- renderPlot({
   running %>%
     filter(distance_miles < input$max_distance) %>%
     ggplot(aes(x = .data[[input$x_axis]], y = .data[[input$y_axis]])) +
-    theme_bw() +
-    geom_point(aes(colour = factor(hr_zone))) +
+    theme_runnr() +
+    geom_point(aes(colour = factor(hr_zone)), alpha = 0.65, size = 1.8) +
+    scale_colour_manual(values = c("Recovery" = "#647EB0", "Easy" = "#267D71",
+      "Med/Long/MP" = "#B47939", "Lac_Thresh" = "#A45D74", "Interval" = "#805DA3"),
+      na.value = "#99A5A0") +
     theme(
-      text = element_text(size = 14),
-      axis.text.x = element_text(angle = 70, hjust = 1)
+      axis.text.x = element_text(angle = 35, hjust = 1)
     ) +
     labs(color = "Heart rate zone")
 })
